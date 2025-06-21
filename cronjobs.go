@@ -24,6 +24,7 @@ type JobInfo struct {
 type Schedule struct {
 	Every   time.Duration
 	StartAt time.Time
+	Amount  int // 0 or a negative number for infinite number of executions
 }
 
 func NewCronJobsManager() *CronJobsManager {
@@ -44,13 +45,12 @@ func (x *CronJobsManager) createJob(id string, description string, ctx context.C
 }
 
 func (x *CronJobsManager) RemoveJob(jobId string) error {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+
 	if job, ok := x.jobs[jobId]; ok {
 		job.Cancel()
-
-		x.mu.Lock()
 		delete(x.jobs, jobId)
-		x.mu.Unlock()
-
 		return nil
 	}
 
@@ -74,22 +74,24 @@ func (x *CronJobsManager) RunJob(ctx context.Context, description string, schedu
 		return "", errors.New("invalid schedule")
 	}
 
-	id, _ := uuid.NewUUID()
-	job := x.createJob(id.String(), description, ctx)
+	id := uuid.New().String()
+	job := x.createJob(id, description, ctx)
 
 	x.mu.Lock()
-	x.jobs[id.String()] = job
+	x.jobs[id] = job
 	x.mu.Unlock()
 
-	if !schedule.StartAt.IsZero() || schedule.Every > 0{
+	if !schedule.StartAt.IsZero() || schedule.Every > 0 {
 		go x.handleJob(job, &schedule, jobFunc)
 	}
 
 	return job.Id, nil
 }
 
-func (x *CronJobsManager) handleJob(job *JobInfo, schedule *Schedule, jobFunc func()){
-	if !schedule.StartAt.IsZero(){
+func (x *CronJobsManager) handleJob(job *JobInfo, schedule *Schedule, jobFunc func()) {
+	defer x.RemoveJob(job.Id)
+
+	if !schedule.StartAt.IsZero() {
 		select {
 		case <-job.context.Done():
 			return
@@ -98,21 +100,24 @@ func (x *CronJobsManager) handleJob(job *JobInfo, schedule *Schedule, jobFunc fu
 		}
 	}
 
-	if schedule.Every == 0{
-		x.RemoveJob(job.Id)
-	}else{
-		defer x.RemoveJob(job.Id)
+	if schedule.Every == 0 {
+		return
+	}
 
-		ticker := time.NewTicker(schedule.Every)
-		defer ticker.Stop()
+	ticker := time.NewTicker(schedule.Every)
+	defer ticker.Stop()
 
-		for {
-			select {
-			case <-job.context.Done():
-				return
-			case <-ticker.C:
-				jobFunc()
-			}
+	var executions int = 0
+	for {
+		select {
+		case <-job.context.Done():
+			return
+		case <-ticker.C:
+			jobFunc()
+		}
+
+		if schedule.Amount > 0 && executions >= schedule.Amount {
+			return
 		}
 	}
 }
